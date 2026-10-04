@@ -1,63 +1,192 @@
-# Cron plugin for Strapi
+# strapi-plugin-secure-cron
 
-**Manage and monitor cron jobs from Strapi admin panel.**
-<br />
-<br />
+**Security-hardened cron jobs for the Strapi 5 admin panel.**
+
+A fork of [@innovato/strapi-plugin-cron](https://github.com/innovato/strapi-plugin-cron) that fixes an
+unauthenticated remote-code-execution issue and adds the controls you need before letting people
+schedule JavaScript inside your CMS:
+
+- 🔐 **Admin authentication always required**: every route is an admin route. There is no `auth: false` and no option to turn auth off.
+- 👥 **Fine-grained RBAC**: grant *read / create / update / delete / trigger* per role from
+  *Settings → Roles → Plugins → Cron*.
+- 🧑‍💻 **Attribution**: every job records `createdBy` and `updatedBy`, shown in the list and detail pages.
+- 🧾 **Audit events**: every change, blocked attempt, acknowledgement and failed run is emitted on
+  Strapi's event hub, so any audit plugin can record it.
+- 🛡️ **Script security check**: scripts are statically analysed (AST rules) when you type, on save,
+  on publish, before scheduling and before a manual run. Dangerous code is blocked, suspicious code needs an acknowledgement.
+- ✍️ **Real code editor**: CodeMirror with JavaScript highlighting, inline findings and a full-screen mode.
+- 🔁 **Edits take effect immediately**: saving a published job reschedules it with the new script.
 
 ![Cron plugin for Strapi](screenshot.png)
 
-## 👋 Get Started
+## Installation
 
-- [Features](#-features)
-- [Installation](#-installation)
-- [Usage](#-usage)
-- [Development](#-development)
-
-## ✨ Features
-
-- GUI integrated with Strapi admin panel
-- tasks scheduling tool incorporating start/end dates and iterations counter
-- script logs & monitoring
-
-## 📦 Installation
-
-1. Run the following command from the Strapi app root directory.
-
-```
-[npm|yarn|bun] add @innovato/strapi-plugin-cron
+```sh
+npm install strapi-plugin-secure-cron
 ```
 
-2. Update or create `./config/plugins.ts` file with the following config:
+`config/plugins.ts`:
 
-```JS
-export default () => ({
+```ts
+export default ({ env }) => ({
   'strapi-plugin-cron': {
     enabled: true,
+    config: {
+      securityCheck: env.bool('CRON_PLUGIN_SECURITY_CHECK', true),
+      syntaxHighlighting: env.bool('CRON_PLUGIN_SYNTAX_HIGHLIGHT', true),
+    },
   },
-})
+});
 ```
 
-3. Run the build command from the Strapi app root directory.
+The plugin keeps the original plugin id (`strapi-plugin-cron`). Existing `cron_jobs` data and the
+`/strapi-plugin-cron/*` route prefix stay compatible when you migrate from the upstream package.
 
+Then rebuild the admin panel: `npm run build`.
+
+### Configuration
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `securityCheck` | `true` | Run the script security check. When `false`, scripts are neither checked nor blocked. |
+| `syntaxHighlighting` | `true` | Use the CodeMirror editor. When `false`, a plain monospace textarea is used (full screen still works). |
+
+Authentication cannot be configured. A config containing `enforceAuth` is rejected at startup.
+
+## Permissions
+
+After installing, super admins have every permission. Grant the others in *Settings → Administration
+panel → Roles → (role) → Plugins → Cron*:
+
+| Permission | Allows |
+| --- | --- |
+| Read cron jobs | See the menu entry, the list, job details and logs |
+| Create cron jobs | Create jobs (and use live script validation) |
+| Update and publish cron jobs | Edit, publish and unpublish jobs (and use live script validation) |
+| Delete cron jobs | Delete jobs |
+| Trigger cron jobs manually | Run a job immediately ("Test run") |
+
+## Writing scripts
+
+A script is the body of an **async function** with three variables in scope:
+
+- `strapi`: the Strapi instance
+- `cronJob`: the job being run (name, iteration counters, …)
+- `console`: a console scoped to this run. Its output becomes the job's *latest execution log*.
+
+```js
+const drafts = await strapi.documents('api::article.article').findMany({
+  filters: { publishedAt: { $null: true } },
+});
+console.log(`Found ${drafts.length} drafts`);
 ```
-[npm|yarn|bun] run build
+
+`resolve()` / `reject()` from the upstream plugin are still available for older scripts.
+
+**File-based scripts (`executeScriptFromFile` / `pathToScript`) were removed.** They bypassed the
+security check and allowed path traversal. Paste the script into the editor instead.
+
+## Writing safe scripts
+
+Every script goes through a static security check. Findings come in two levels:
+
+- **⛔ error**: the script cannot be saved, published, scheduled or triggered.
+- **⚠️ warning**: the script can be saved only after ticking *"I reviewed the security warnings"*.
+  The acknowledgement is recorded as an audit event. Unchanged scripts don't need to be acknowledged again.
+
+> The check is a defense layer, not a sandbox. It stops careless dangerous code and obvious malware,
+> but someone with script-editing rights and enough determination can still get around static analysis.
+> Grant *create* and *update* only to people you would trust with server access.
+
+<!-- rules:start -->
+| Rule | Severity | What it catches and why |
+| --- | --- | --- |
+| `no-dangerous-modules` | ⛔ error | Loading Node.js system modules is not allowed. Modules such as child_process, fs, net, http and vm give a script shell, filesystem and network access to the server. Use the strapi APIs passed to the script instead. |
+| `no-dynamic-module-loading` | ⛔ error | Loading modules is not allowed in cron scripts. require() and import() are how a script escapes the strapi API surface. Computed module names also defeat static review. Everything a cron script needs is available on the strapi object. |
+| `no-code-evaluation` | ⛔ error | Evaluating strings as code is not allowed. eval, the Function constructor and string-based timers run arbitrary code that cannot be reviewed or security-checked. Write the logic directly in the script. |
+| `no-process-access` | ⛔ error | Accessing the Node.js process object is not allowed. process exposes environment variables (secrets), process.exit, process.binding and process.mainModule.require, which bypass every other safeguard. |
+| `no-global-tampering` | ⛔ error | Modifying globals, built-in prototypes or the strapi object is not allowed. Overwriting globals, prototypes or strapi internals changes the behaviour of the whole server process, not only the script, and is a common persistence technique. |
+| `no-prototype-escape` | ⛔ error | Reaching constructors through prototypes is not allowed. Chains like x.constructor.constructor or __proto__ reach the Function constructor and evaluate arbitrary code without the words eval or Function appearing in the script. |
+| `no-raw-database` | ⛔ error | Raw database access is not allowed. strapi.db.connection (knex) and .raw() run arbitrary SQL, bypassing Strapi validation and access control, and can read admin users, tokens and secrets. Use strapi.documents() instead. |
+| `no-strapi-internals` | ⛔ error | Accessing sensitive strapi internals is not allowed. Cron scripts should work with content through strapi.documents(). Configuration, server lifecycle and container internals expose secrets or can take the server down. |
+| `no-sensitive-services` | ⛔ error | Accessing admin or users-permissions internals is not allowed. Admin users, roles, API tokens and users-permissions accounts control who can access the CMS. A cron script that can read or change them is an account-takeover risk. |
+| `no-obfuscation` | ⚠️ warning | The script contains patterns commonly used to hide code. Encoded payloads, heavy escape sequences and character-code assembly hide what a script really does from reviewers and from this check. Keep scripts readable; store large data in content types instead. |
+| `no-dynamic-property-access` | ⚠️ warning | Computed property access on strapi or globals cannot be checked. strapi[name] or globalThis[name] lets a script reach any internal at runtime, so the static check cannot tell what it touches. Use literal property names. |
+| `no-infinite-loops` | ⚠️ warning | The script contains a loop that never exits. Scripts run inside the Strapi server process. A loop without an exit blocks the event loop and freezes the whole CMS. |
+| `no-network-calls` | ⚠️ warning | The script makes outbound network requests. Outbound requests can send CMS data to third parties. They are sometimes legitimate (webhooks, cache warming); make sure the destination is trusted before acknowledging. |
+| `no-bulk-deletes` | ⚠️ warning | The script deletes content in bulk. deleteMany() or delete() inside a loop can wipe a whole collection on every tick. Double-check the filters before acknowledging. |
+| `no-self-modification` | ⚠️ warning | The script accesses cron jobs themselves. A cron job that edits cron jobs can rewrite scripts after they passed this check, without leaving an audit trail of who changed them. Manage cron jobs through the admin panel. |
+| `no-deprecated-apis` | ⚠️ warning | The script uses a deprecated Strapi API. strapi.entityService is deprecated in Strapi 5 and skips document-level logic. Use strapi.documents() instead. |
+<!-- rules:end -->
+
+### Adding rules
+
+Rules live in `server/src/security/rules/`, one file per rule, registered in `rules/index.ts`. Each rule
+is `{ id, severity, description, rationale, create(context) }`, where `create` returns AST visitors
+keyed by node type (ESLint style) that call `context.report(node, message)`. Add bad and good samples for the
+rule to `server/src/security/__tests__/rules.test.ts` (a test fails if a rule has no cases), then run
+`npm run docs:rules` to refresh the table above.
+
+## Audit events
+
+Events are emitted on `strapi.eventHub` as `strapi-plugin-cron.cron-job.<action>`:
+
+| Action | When |
+| --- | --- |
+| `create`, `update`, `delete` | A job is created, edited or deleted (`update` includes changed fields, script hashes and a unified diff capped at 64 KB) |
+| `publish`, `unpublish` | A job is (un)scheduled |
+| `trigger` | Someone pressed *Test run* |
+| `run.succeeded` | A manual run finished |
+| `run.failed` | A manual or scheduled run threw, or a published script failed the check at schedule time |
+| `blocked` | A save, publish or trigger was refused by the security check |
+| `warnings-acknowledged` | A script with warnings was saved after acknowledgement |
+
+Payload:
+
+```ts
+{
+  action: 'update',
+  user: { id, documentId, firstname, lastname, username, email } | null, // null for scheduled runs
+  entity: { type: 'cron-job', uid: 'plugin::strapi-plugin-cron.cron-job', id: documentId, displayName: name },
+  ipAddress: string | null,
+  timestamp: string,
+  details: { ... },
+}
 ```
 
-## 📌 Usage
+With [prima-audit](https://www.npmjs.com/package/prima-audit) ≥ 2.1:
 
-If you want to maintain your cron job script files within the parent project and track them with a VCS, you should place them in a location relative to `<your-strapi-project>/src/extensions/strapi-plugin-cron/`.
-
-The script file should be a `.js` module which exports an async function:
-
-```JS
-module.exports = async ({ strapi, cronJob }) => {
-};
+```ts
+'prima-audit': { config: { eventSubscriptions: ['strapi-plugin-cron.*'] } }
 ```
 
-The function has access to `strapi` global variable and the relevant `cronJob` object.
+## HTTP API
 
-The script snippet maintained via the Cron plugin dashboard has a direct top-level access to those parameters.
+All routes are admin routes under `/strapi-plugin-cron` and require an admin session token plus the
+listed permission.
 
-## 🔧 Development
+| Method | Path | Permission |
+| --- | --- | --- |
+| GET | `/cron-jobs`, `/cron-jobs/:documentId`, `/settings`, `/security-rules` | read |
+| POST | `/cron-jobs` | create |
+| PUT | `/cron-jobs/:documentId`, `/cron-jobs/publish/:documentId`, `/cron-jobs/unpublish/:documentId` | update |
+| DELETE | `/cron-jobs/:documentId` | delete |
+| POST | `/cron-jobs/trigger/:documentId` | trigger |
+| POST | `/cron-jobs/validate-script` | create or update |
 
-A supplementary repository for development is available here [@mjnoach/strapi--strapi-plugin-cron](https://github.com/mjnoach/strapi--strapi-plugin-cron)
+Saving a script with warnings requires `"acknowledgeWarnings": true` in the body. A refused save
+responds `422` with `error.name = "SecurityCheckError"` and the findings in `error.details`.
+
+## Development
+
+```sh
+npm install
+npm run test:unit         # server unit tests (coverage gate: 90%)
+npm run test:admin        # admin React tests (coverage gate: 80%)
+npm run test:integration  # builds, boots a real Strapi 5 app on SQLite and exercises the HTTP API
+npm test                  # all of the above
+```
+
+## License
+
+MIT. Based on the work of [Innovato](https://innovato.nl) and [mjnoach](https://github.com/mjnoach).

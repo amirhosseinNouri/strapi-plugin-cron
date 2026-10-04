@@ -1,4 +1,6 @@
 import {
+  Alert,
+  Box,
   Button,
   Checkbox,
   DatePicker,
@@ -6,22 +8,27 @@ import {
   Flex,
   NumberInput,
   TextInput,
+  Typography,
 } from '@strapi/design-system';
 import { Calendar } from '@strapi/icons';
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { CronJob, CronJobInputData, CronJobInputErrors } from '../../../types';
-import { PLUGIN_ID } from '../../../utils/plugin';
+import type {
+  CronJob,
+  CronJobInputData,
+  CronJobInputErrors,
+  SecurityCheckResult,
+} from '../../../types';
+import { ApiError, type CronJobPayload } from '../api/cron';
 import { FormField } from '../components/FormField';
+import { useScriptValidation } from '../hooks/useScriptValidation';
+import { useSettings } from '../hooks/useSettings';
 import { getDateAndTimeString, mapLocalDateToUTC } from '../utils/date';
-
-import { Textarea } from '@strapi/design-system';
+import { ScriptEditor, SecurityFindings, type ScriptEditorHandle } from './ScriptEditor';
 
 const initialState: CronJobInputData = {
   name: '',
   schedule: '',
-  executeScriptFromFile: true,
-  pathToScript: '/example-cron-script.js',
   script: [
     'console.log(`${cronJob.name} – ${cronJob.iterationsCount} / ${cronJob.iterationsLimit}`)',
   ].join('\n'),
@@ -30,52 +37,117 @@ const initialState: CronJobInputData = {
   endDate: new Date(new Date().setHours(23, 59, 59, 999)).toISOString(),
 };
 
+const pickInput = (cronJob: CronJob): CronJobInputData => ({
+  name: cronJob.name,
+  schedule: cronJob.schedule,
+  script: cronJob.script ?? '',
+  iterationsLimit: cronJob.iterationsLimit,
+  startDate: cronJob.startDate,
+  endDate: cronJob.endDate,
+});
+
 type Props = {
   initialData?: CronJob;
-  handleSubmit: (data: CronJobInputData) => Promise<any>;
+  handleSubmit: (data: CronJobPayload) => Promise<any>;
   previewData?: boolean;
 };
 
 export const CronJobForm: React.FunctionComponent<Props> = (props) => {
-  const [input, setInput] = useState<CronJobInputData>(props.initialData ?? initialState);
+  const [input, setInput] = useState<CronJobInputData>(
+    props.initialData ? pickInput(props.initialData) : initialState
+  );
   const [errors, setErrors] = useState<CronJobInputErrors>({});
+  const [acknowledged, setAcknowledged] = useState(false);
+  const [serverResult, setServerResult] = useState<SecurityCheckResult | null>(null);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const editorRef = useRef<ScriptEditorHandle>(null);
   const navigate = useNavigate();
+  const settings = useSettings();
+
+  const validation = useScriptValidation(input.script, {
+    enabled: settings.securityCheck && !props.previewData,
+  });
+  const securityResult = serverResult ?? validation.result;
+  const hasErrors = (securityResult?.errors ?? 0) > 0;
+  // Warnings were already acknowledged when an existing script was saved; only a
+  // new or changed script needs a fresh acknowledgement (mirrors the server rule).
+  const scriptChanged = !props.initialData || input.script !== (props.initialData.script ?? '');
+  const hasWarnings = (securityResult?.warnings ?? 0) > 0;
+  const needsAcknowledgement = hasWarnings && !hasErrors && scriptChanged;
 
   function handleInputChange(e: any) {
     const { name, value } = e.target;
-    setInput({ ...input, [name]: value });
-    setErrors({ ...errors, [name]: null });
+    setInput((current) => ({ ...current, [name]: value }));
+    setErrors((current) => ({ ...current, [name]: undefined }));
+  }
+
+  function handleScriptChange(script: string) {
+    setInput((current) => ({ ...current, script }));
+    setErrors((current) => ({ ...current, script: undefined }));
+    setServerResult(null);
+    setAcknowledged(false);
   }
 
   function handleDateChange(inputName: string, value: Date) {
-    if (inputName === 'startDate') value?.setHours(0, 0, 0, 0);
-    if (inputName === 'endDate') value?.setHours(23, 59, 59, 999);
+    if (!value) return;
+    if (inputName === 'startDate') value.setHours(0, 0, 0, 0);
+    if (inputName === 'endDate') value.setHours(23, 59, 59, 999);
     handleInputChange({
       target: { name: inputName, value: value.toISOString() },
     });
   }
 
-  async function handleSubmit(e: any) {
+  async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
+    setSubmitError(null);
+    setIsSubmitting(true);
     try {
-      await props.handleSubmit?.(input);
+      await props.handleSubmit({ ...input, acknowledgeWarnings: acknowledged });
     } catch (error: any) {
-      if (error.message === 'ValidationError') {
-        const errors: Record<string, string> = {};
-        error.details.errors.map(({ path: [name], message }: any) => {
-          errors[name] = message;
+      if (error instanceof ApiError && error.name === 'ValidationError') {
+        const fieldErrors: Record<string, string> = {};
+        (error.details.errors ?? []).forEach(({ path: [name], message }) => {
+          fieldErrors[name] = message;
         });
-        setErrors(errors);
+        setErrors(fieldErrors);
+      } else if (error instanceof ApiError && error.name === 'SecurityCheckError') {
+        const findings = error.details.findings ?? [];
+        const errorCount = findings.filter((finding) => finding.severity === 'error').length;
+        setServerResult({
+          enabled: true,
+          passed: errorCount === 0,
+          errors: errorCount,
+          warnings: findings.length - errorCount,
+          findings,
+        });
+        setSubmitError(error.message);
       } else {
-        throw error;
+        setSubmitError(error?.message ?? 'Something went wrong while saving the cron job.');
       }
+    } finally {
+      setIsSubmitting(false);
     }
   }
 
   const today = new Date();
+  const preview = Boolean(props.previewData);
 
   return (
-    <form onSubmit={handleSubmit}>
+    <form onSubmit={handleSubmit} noValidate={false}>
+      {submitError && (
+        <Box marginBottom={5}>
+          <Alert
+            variant="danger"
+            title="Could not save"
+            closeLabel="Close"
+            onClose={() => setSubmitError(null)}
+          >
+            {submitError}
+          </Alert>
+        </Box>
+      )}
+
       <FormField name="name" label="Name" error={errors['name']}>
         <TextInput
           placeholder="Cron job name"
@@ -83,19 +155,18 @@ export const CronJobForm: React.FunctionComponent<Props> = (props) => {
           onChange={handleInputChange}
           value={input.name}
           required
-          disabled={props.previewData}
+          disabled={preview}
         />
       </FormField>
 
       <FormField name="schedule" label="Schedule" error={errors['schedule']}>
         <TextInput
-          placeholder="Cron job schdule expression"
+          placeholder="Cron job schedule expression"
           required
-          label="Schedule"
           name="schedule"
           value={input.schedule}
           onChange={handleInputChange}
-          disabled={props.previewData}
+          disabled={preview}
         />
       </FormField>
 
@@ -105,7 +176,7 @@ export const CronJobForm: React.FunctionComponent<Props> = (props) => {
         hint="Publish on this date"
         error={errors['startDate']}
       >
-        {props.previewData ? (
+        {preview ? (
           <Field.Input
             disabled
             startAction={<Calendar />}
@@ -116,9 +187,8 @@ export const CronJobForm: React.FunctionComponent<Props> = (props) => {
             id="startDate"
             initialDate={mapLocalDateToUTC(input.startDate)}
             onChange={(value: any) => handleDateChange('startDate', value)}
-            disabled={props.previewData}
             required
-            minDate={mapLocalDateToUTC(today.toISOString())}
+            minDate={props.initialData ? undefined : mapLocalDateToUTC(today.toISOString())}
           />
         )}
       </FormField>
@@ -129,7 +199,7 @@ export const CronJobForm: React.FunctionComponent<Props> = (props) => {
         hint="Unpublish on this date"
         error={errors['endDate']}
       >
-        {props.previewData ? (
+        {preview ? (
           <Field.Input
             disabled
             startAction={<Calendar />}
@@ -140,7 +210,6 @@ export const CronJobForm: React.FunctionComponent<Props> = (props) => {
             id="endDate"
             initialDate={mapLocalDateToUTC(input.endDate)}
             onChange={(value: any) => handleDateChange('endDate', value)}
-            disabled={props.previewData}
             required
             minDate={mapLocalDateToUTC(today.toISOString())}
           />
@@ -162,41 +231,8 @@ export const CronJobForm: React.FunctionComponent<Props> = (props) => {
             })
           }
           value={input.iterationsLimit}
-          disabled={props.previewData}
+          disabled={preview}
           required
-        />
-      </FormField>
-
-      <FormField name="executeScriptFromFile" label="" error={errors['executeScriptFromFile']}>
-        <Checkbox
-          name="executeScriptFromFile"
-          checked={input.executeScriptFromFile}
-          onClick={(value: any) =>
-            handleInputChange({
-              target: {
-                name: 'executeScriptFromFile',
-                value: !input.executeScriptFromFile,
-              },
-            })
-          }
-          disabled={props.previewData}
-        >
-          Execute script from a file
-        </Checkbox>
-      </FormField>
-
-      <FormField
-        name="pathToScript"
-        label="Path to script file"
-        hint={`Relative to ./src/extensions/${PLUGIN_ID}`}
-        error={input.executeScriptFromFile ? errors['pathToScript'] : undefined}
-      >
-        <TextInput
-          name="pathToScript"
-          onChange={handleInputChange}
-          value={input.pathToScript}
-          required
-          disabled={props.previewData || !input.executeScriptFromFile}
         />
       </FormField>
 
@@ -204,19 +240,51 @@ export const CronJobForm: React.FunctionComponent<Props> = (props) => {
         name="script"
         label="Script"
         width="100%"
-        error={!input.executeScriptFromFile ? errors['script'] : undefined}
+        error={errors['script']}
+        hint="Runs as the body of an async function with `strapi`, `cronJob` and `console` in scope."
       >
-        <Textarea
-          name="script"
+        <ScriptEditor
+          ref={editorRef}
           value={input.script}
-          onChange={handleInputChange}
-          disabled={props.previewData || input.executeScriptFromFile}
+          onChange={handleScriptChange}
+          readOnly={preview}
+          highlight={settings.syntaxHighlighting}
+          findings={securityResult?.findings ?? []}
+          footer={
+            !preview && (
+              <SecurityFindings
+                result={securityResult}
+                isValidating={!serverResult && validation.isValidating}
+                onSelect={(finding) => editorRef.current?.focusAt(finding.line, finding.column)}
+              />
+            )
+          }
         />
       </FormField>
 
-      {!props.previewData && (
+      {!preview && needsAcknowledgement && (
+        <Box marginBottom={5}>
+          <Checkbox
+            name="acknowledgeWarnings"
+            checked={acknowledged}
+            onCheckedChange={(checked: boolean) => setAcknowledged(checked === true)}
+          >
+            I reviewed the security warnings above and want to save this script anyway
+          </Checkbox>
+          <Typography variant="pi" textColor="neutral600">
+            Your acknowledgement is recorded in the audit log.
+          </Typography>
+        </Box>
+      )}
+
+      {!preview && (
         <Flex gap={5} marginTop={5}>
-          <Button size="L" type="submit">
+          <Button
+            size="L"
+            type="submit"
+            loading={isSubmitting}
+            disabled={hasErrors || (needsAcknowledgement && !acknowledged)}
+          >
             Save
           </Button>
           <Button size="L" variant="tertiary" onClick={() => navigate(-1)}>
@@ -229,5 +297,5 @@ export const CronJobForm: React.FunctionComponent<Props> = (props) => {
 };
 
 export const CronJobFormView = ({ data }: { data: CronJob }) => {
-  return <CronJobForm previewData handleSubmit={Promise.resolve} initialData={data} />;
+  return <CronJobForm previewData handleSubmit={() => Promise.resolve()} initialData={data} />;
 };
