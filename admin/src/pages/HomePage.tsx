@@ -21,18 +21,23 @@ import {
 } from '@strapi/design-system';
 import { CaretDown, CaretUp, Pencil, Play, Plus, Trash } from '@strapi/icons';
 import { EmptyDocuments } from '@strapi/icons/symbols';
-import { Page } from '@strapi/strapi/admin';
+import { Page, useRBAC } from '@strapi/strapi/admin';
 import { useMutation, useQuery } from '@tanstack/react-query';
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { CronJob } from '../../../types';
 import { pluginBasePath } from '../../../utils/plugin';
-import { cronApi } from '../api/cron';
+import { useCronApi } from '../api/cron';
+import { allPluginPermissions } from '../permissions';
+import { formatUser } from '../utils/user';
 import { PageLayout } from '../components/PageLayout';
 import { getDateAndTimeString, getDateString } from '../utils/date';
 
 export const HomePage: React.FunctionComponent = () => {
   const navigate = useNavigate();
+  const api = useCronApi();
+  const { allowedActions } = useRBAC(allPluginPermissions);
+  const { canCreate, canUpdate, canDelete, canTrigger } = allowedActions;
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('asc');
   const [sortKey, setSortKey] = useState<'name' | 'startDate' | 'endDate' | 'publicationDate'>(
     'name'
@@ -44,10 +49,10 @@ export const HomePage: React.FunctionComponent = () => {
     refetch,
   } = useQuery({
     queryKey: ['cronJobs'],
-    queryFn: () => cronApi.getAllCronJobs(),
+    queryFn: () => api.getAllCronJobs(),
   });
   const deleteMutation = useMutation({
-    mutationFn: cronApi.deleteCronJob,
+    mutationFn: api.deleteCronJob,
     onSuccess: () => {
       refetch();
     },
@@ -55,8 +60,8 @@ export const HomePage: React.FunctionComponent = () => {
 
   async function handleTriggerClick(cronJob: CronJob) {
     try {
-      await cronApi.triggerCronJob(cronJob.documentId);
-      setTriggerStatus('success');
+      const result = await api.triggerCronJob(cronJob.documentId);
+      setTriggerStatus(result.success ? 'success' : 'error');
     } catch (e) {
       setTriggerStatus('error');
     } finally {
@@ -82,8 +87,9 @@ export const HomePage: React.FunctionComponent = () => {
     const confirmation = confirm(message);
     if (!confirmation) return;
     await (isPublished
-      ? cronApi.unpublishCronJob(cronJob.documentId)
-      : cronApi.publishCronJob(cronJob.documentId));
+      ? api.unpublishCronJob(cronJob.documentId)
+      : api.publishCronJob(cronJob.documentId)
+    ).catch((error: Error) => alert(error.message));
     refetch();
   }
 
@@ -132,12 +138,14 @@ export const HomePage: React.FunctionComponent = () => {
           icon={<EmptyDocuments style={{ width: '200px', height: '200px' }} />}
           content="You don't have any cron jobs yet..."
           action={
-            <Button
-              startIcon={<Plus />}
-              onClick={() => navigate(`${pluginBasePath}/cron-jobs/create`)}
-            >
-              Add new cron job
-            </Button>
+            canCreate ? (
+              <Button
+                startIcon={<Plus />}
+                onClick={() => navigate(`${pluginBasePath}/cron-jobs/create`)}
+              >
+                Add new cron job
+              </Button>
+            ) : undefined
           }
         />
       </PageLayout>
@@ -151,16 +159,18 @@ export const HomePage: React.FunctionComponent = () => {
       <Box marginBottom={8}>
         <Table
           rowCount={6}
-          colCount={10}
+          colCount={8}
           footer={
-            <TFooter
-              onClick={() => {
-                navigate(`${pluginBasePath}/cron-jobs/create`);
-              }}
-              icon={<Plus />}
-            >
-              Add new cron job
-            </TFooter>
+            canCreate ? (
+              <TFooter
+                onClick={() => {
+                  navigate(`${pluginBasePath}/cron-jobs/create`);
+                }}
+                icon={<Plus />}
+              >
+                Add new cron job
+              </TFooter>
+            ) : undefined
           }
         >
           <Thead>
@@ -182,6 +192,9 @@ export const HomePage: React.FunctionComponent = () => {
               </Th>
               <Th action={<SortButton sortKey="publicationDate" />}>
                 <Typography variant="sigma">Status</Typography>
+              </Th>
+              <Th>
+                <Typography variant="sigma">Last updated by</Typography>
               </Th>
               <Th action={null}>
                 <VisuallyHidden>Actions</VisuallyHidden>
@@ -232,40 +245,53 @@ export const HomePage: React.FunctionComponent = () => {
                   )}
                 </Td>
                 <Td>
+                  <Tooltip
+                    label={`Created by ${formatUser(cronJob.createdBy)} · Updated ${getDateAndTimeString(cronJob.updatedAt)}`}
+                  >
+                    <Typography textColor="neutral800">{formatUser(cronJob.updatedBy)}</Typography>
+                  </Tooltip>
+                </Td>
+                <Td>
                   <Flex justifyContent="justify-evenly">
                     <Flex paddingLeft="10px" paddingRight="10px">
-                      <Box marginLeft={2}>
-                        <IconButton
-                          disabled={!!cronJob.publicationDate}
-                          size="XS"
-                          label="Edit"
-                          onClick={() => handleEditClick(cronJob)}
-                        >
-                          <Pencil />
-                        </IconButton>
-                      </Box>
-                      <Box marginLeft={2}>
-                        <IconButton
-                          size="XS"
-                          label="Delete"
-                          onClick={() => handleDeleteClick(cronJob)}
-                        >
-                          <Trash />
-                        </IconButton>
-                      </Box>
-                      <Box marginLeft={2}>
-                        <IconButton
-                          size="XS"
-                          label="Test Run"
-                          onClick={() => handleTriggerClick(cronJob)}
-                        >
-                          <Play />
-                        </IconButton>
-                      </Box>
+                      {canUpdate && (
+                        <Box marginLeft={2}>
+                          <IconButton
+                            size="XS"
+                            label="Edit"
+                            onClick={() => handleEditClick(cronJob)}
+                          >
+                            <Pencil />
+                          </IconButton>
+                        </Box>
+                      )}
+                      {canDelete && (
+                        <Box marginLeft={2}>
+                          <IconButton
+                            size="XS"
+                            label="Delete"
+                            onClick={() => handleDeleteClick(cronJob)}
+                          >
+                            <Trash />
+                          </IconButton>
+                        </Box>
+                      )}
+                      {canTrigger && (
+                        <Box marginLeft={2}>
+                          <IconButton
+                            size="XS"
+                            label="Test Run"
+                            onClick={() => handleTriggerClick(cronJob)}
+                          >
+                            <Play />
+                          </IconButton>
+                        </Box>
+                      )}
                     </Flex>
                     <Switch
                       label="Toggle"
                       checked={!!cronJob.publicationDate}
+                      disabled={!canUpdate}
                       onCheckedChange={() => handleToggleChange(cronJob)}
                     />
                   </Flex>
@@ -309,7 +335,7 @@ const TriggerAlert = ({
       }}
     >
       <Flex direction="column" alignItems="center">
-        <Alert closeLabel="asdasdasddas" title="Test Run:" variant={variant} onClose={onClose}>
+        <Alert closeLabel="Close" title="Test Run:" variant={variant} onClose={onClose}>
           {message}
         </Alert>
       </Flex>

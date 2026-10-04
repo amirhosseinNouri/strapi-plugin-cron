@@ -1,0 +1,7 @@
+{
+  "name": "secure-cron-test-app",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Fixture Strapi app used by the plugin integration tests.",
+  "strapi": { "uuid": "secure-cron-test-app" }
+}

@@ -28,15 +28,9 @@
       "type": "string",
       "required": true
     },
-    "executeScriptFromFile": {
-      "type": "boolean",
-      "default": true
-    },
-    "pathToScript": {
-      "type": "string"
-    },
     "script": {
-      "type": "text"
+      "type": "text",
+      "required": true
     },
     "iterationsLimit": {
       "type": "integer",

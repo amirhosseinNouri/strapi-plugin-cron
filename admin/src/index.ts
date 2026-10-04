@@ -1,6 +1,7 @@
 import { PLUGIN_ID, pluginDisplayName } from '../../utils/plugin';
 import { Initializer } from './components/Initializer';
 import { PluginIcon } from './components/PluginIcon';
+import { pluginPermissions } from './permissions';
 
 export default {
   register(app: any) {
@@ -12,6 +13,7 @@ export default {
         defaultMessage: pluginDisplayName,
       },
       Component: () => import('./pages/App'),
+      permissions: pluginPermissions.read,
     });
 
     app.registerPlugin({

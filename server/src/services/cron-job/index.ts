@@ -1,65 +1,71 @@
+import { Core } from '@strapi/strapi';
+import type { CronJob } from '../../../../types';
 import { PLUGIN_ID } from '../../../../utils/plugin';
 
-import { Core } from '@strapi/strapi';
+const UID = `plugin::${PLUGIN_ID}.cron-job` as const;
 
-export default ({ strapi }: { strapi: Core.Strapi }) => ({
-  getAll: async () => {
-    const cronJobs = await strapi.documents(`plugin::${PLUGIN_ID}.cron-job`).findMany();
-    return cronJobs;
-  },
-  getOne: async (documentId: string) => {
-    return strapi.documents(`plugin::${PLUGIN_ID}.cron-job`).findOne({
-      documentId,
-    });
-  },
-  getPublished: async () => {
-    return strapi.documents(`plugin::${PLUGIN_ID}.cron-job`).findMany({
-      filters: {
-        publicationDate: {
-          $notNull: true,
-        },
-      },
-    });
-  },
-  create: async (data) => {
-    return strapi.documents(`plugin::${PLUGIN_ID}.cron-job`).create({
-      data,
-    });
-  },
-  update: async (documentId: string, data) => {
-    return strapi.documents(`plugin::${PLUGIN_ID}.cron-job`).update({
-      documentId,
-      data,
-    });
-  },
-  publish: async (documentId: string) => {
-    const cronJob = await strapi.documents(`plugin::${PLUGIN_ID}.cron-job`).update({
-      documentId,
-      data: {
-        // @ts-ignore
-        iterationsCount: 0,
-        publicationDate: new Date(),
-      },
-    });
-    await strapi.plugin(PLUGIN_ID).service('cron').updateSchedule(cronJob);
-    return cronJob;
-  },
-  unpublish: async (documentId: string) => {
-    const cronJob = await strapi.documents(`plugin::${PLUGIN_ID}.cron-job`).update({
-      documentId,
-      data: {
-        // @ts-ignore
-        publicationDate: null,
-      },
-    });
-    await strapi.plugin(PLUGIN_ID).service('cron').updateSchedule(cronJob);
-    return cronJob;
-  },
-  delete: async (documentId: string) => {
-    const cronJob = await strapi.documents(`plugin::${PLUGIN_ID}.cron-job`).delete({
-      documentId,
-    });
-    await strapi.plugin(PLUGIN_ID).service('cron').cancel(cronJob);
-    return;
-  },
-});
+// `email` is a private admin::user attribute and cannot be populated.
+const CREATOR_FIELDS = ['firstname', 'lastname', 'username'];
+
+const populateCreators = {
+  createdBy: { fields: CREATOR_FIELDS },
+  updatedBy: { fields: CREATOR_FIELDS },
+};
+
+type UserRef = { id: number } | null | undefined;
+
+export default ({ strapi }: { strapi: Core.Strapi }) => {
+  const documents = () => strapi.documents(UID as any) as any;
+  const cronService = () => strapi.plugin(PLUGIN_ID).service('cron');
+
+  return {
+    async getAll(): Promise<CronJob[]> {
+      return documents().findMany({ populate: populateCreators });
+    },
+
+    async getOne(documentId: string): Promise<CronJob | null> {
+      return documents().findOne({ documentId, populate: populateCreators });
+    },
+
+    async getPublished(): Promise<CronJob[]> {
+      return documents().findMany({ filters: { publicationDate: { $notNull: true } } });
+    },
+
+    async create(data: Partial<CronJob>, user?: UserRef): Promise<CronJob> {
+      return documents().create({
+        data: { ...data, ...(user ? { createdBy: user.id, updatedBy: user.id } : {}) },
+        populate: populateCreators,
+      });
+    },
+
+    /** Internal updates (execution logs, counters) pass no user and keep updatedBy as is. */
+    async update(documentId: string, data: Partial<CronJob>, user?: UserRef): Promise<CronJob> {
+      return documents().update({
+        documentId,
+        data: { ...data, ...(user ? { updatedBy: user.id } : {}) },
+        populate: populateCreators,
+      });
+    },
+
+    async publish(documentId: string, user?: UserRef): Promise<CronJob> {
+      const cronJob = await this.update(
+        documentId,
+        { iterationsCount: 0, publicationDate: new Date().toISOString() },
+        user
+      );
+      await cronService().updateSchedule(cronJob);
+      return cronJob;
+    },
+
+    async unpublish(documentId: string, user?: UserRef): Promise<CronJob> {
+      const cronJob = await this.update(documentId, { publicationDate: null }, user);
+      await cronService().updateSchedule(cronJob);
+      return cronJob;
+    },
+
+    async delete(documentId: string): Promise<void> {
+      cronService().cancel({ documentId });
+      await documents().delete({ documentId });
+    },
+  };
+};

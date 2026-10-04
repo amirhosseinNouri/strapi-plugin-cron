@@ -1,28 +1,28 @@
 import { Page } from '@strapi/strapi/admin';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import React from 'react';
-import { useLocation, useNavigate } from 'react-router-dom';
-import { CronJob, CronJobInputData } from '../../../types';
+import { useNavigate, useParams } from 'react-router-dom';
 import { pluginBasePath } from '../../../utils/plugin';
-import { cronApi } from '../api/cron';
+import { useCronApi, type CronJobPayload } from '../api/cron';
 import { ContentBlock } from '../components/ContentBlock';
 import { CronJobForm } from '../components/CronJobForm';
 import { NotFound } from '../components/NotFound';
 import { PageLayout } from '../components/PageLayout';
 
 export const EditCronJobPage: React.FunctionComponent = () => {
-  const location = useLocation();
-  const documentId = location.pathname.split('/').at(-1) as string;
+  const { documentId = '' } = useParams();
   const navigate = useNavigate();
+  const api = useCronApi();
   const { isPending, data: cronJob } = useQuery({
     queryKey: ['cronJob', documentId],
-    queryFn: () => cronApi.getCronJob(documentId),
+    queryFn: () => api.getCronJob(documentId),
   });
   const queryClient = useQueryClient();
   const mutation = useMutation({
-    mutationFn: cronApi.updateCronJob,
-    onSuccess: (cronJob: CronJob) => {
+    mutationFn: api.updateCronJob,
+    onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['cronJob', documentId] });
+      queryClient.invalidateQueries({ queryKey: ['cronJobs'] });
       navigate(pluginBasePath);
     },
   });
@@ -32,11 +32,11 @@ export const EditCronJobPage: React.FunctionComponent = () => {
   if (!cronJob) return <NotFound />;
 
   return (
-    <PageLayout title={'Edit Cron Cob'}>
+    <PageLayout title="Edit Cron Job">
       <ContentBlock>
         <CronJobForm
           initialData={cronJob}
-          handleSubmit={(data: CronJobInputData) => mutation.mutateAsync({ documentId, data })}
+          handleSubmit={(data: CronJobPayload) => mutation.mutateAsync({ documentId, data })}
         />
       </ContentBlock>
     </PageLayout>
